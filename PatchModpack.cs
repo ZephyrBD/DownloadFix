@@ -36,6 +36,7 @@ class PatchModpack
 
         PatchDispatch();
         PatchEntry(noFilter, keepStack);
+        PatchDetailClick();
 
         m.Write(outPath);
         Console.WriteLine("written: " + outPath);
@@ -238,6 +239,157 @@ class PatchModpack
         body.KeepOldMaxStack = keepStack;
         body.UpdateInstructionOffsets();
         Console.WriteLine("entry   : instrs=" + il.Count);
+    }
+
+    // Restore the version-item click behaviour on the resource detail page.
+    // Newer builds keep Install_Click and its proxy lambda in the binary but no
+    // longer wire them up, so clicking a version only saves the archive. This
+    // re-adds the original branch: for modpacks the item click installs, and
+    // the icon button saves; for every other resource type nothing changes.
+    static void PatchDetailClick()
+    {
+        var page = m.Find("PCL.PageDownloadResourceDetail", false) as TypeDef;
+        if (page == null) throw new Exception("detail page type not found");
+        var md = page.Methods.FirstOrDefault(x =>
+            x.Name == "InitializeStackResourceVersions" && x.MethodSig.Params.Count == 1);
+        if (md == null || md.Body == null) throw new Exception("version list method not found");
+        var body = md.Body;
+        var il = body.Instructions;
+
+        var typeField = page.Fields.FirstOrDefault(f => f.Name == "TargetResourceType");
+        if (typeField == null) throw new Exception("target type field not found");
+
+        // The method already reads the field once before the version loop.
+        int reads = 0;
+        foreach (var ins in il)
+            if (ins.OpCode == OpCodes.Ldfld && ins.Operand == typeField) reads++;
+        if (reads > 1)
+        {
+            Console.WriteLine("detail : already applied");
+            return;
+        }
+
+        var install = page.Methods.FirstOrDefault(x =>
+            x.Name == "Install_Click" && x.MethodSig.Params.Count == 2);
+        if (install == null) throw new Exception("install handler not found");
+
+        // The proxy is the compiler-generated lambda that calls Install_Click.
+        MethodDef proxy = null;
+        foreach (var cand in page.Methods)
+        {
+            if (cand.Body == null) continue;
+            foreach (var ins in cand.Body.Instructions)
+            {
+                var mr = ins.Operand as IMethod;
+                if (ins.OpCode == OpCodes.Call && mr != null &&
+                    mr.Name == "Install_Click" &&
+                    mr.DeclaringType.FullName == page.FullName)
+                { proxy = cand; break; }
+            }
+            if (proxy != null) break;
+        }
+        if (proxy == null) throw new Exception("install proxy not found");
+
+        // Locate the block that creates one version row:
+        //   ldarg.1 / callvirt get_Children / ldloc.s v / ldarg.0
+        //   ldftn Save_Click / newobj MyListItem/ClickEventHandler / ldnull
+        //   ldloc.1 / callvirt ToListItem / callvirt Add / pop
+        int at = -1;
+        for (int k = 0; k + 11 < il.Count; k++)
+        {
+            if (il[k].OpCode != OpCodes.Ldarg_1) continue;
+            if (!IsCall(il[k + 1], "get_Children")) continue;
+            if (il[k + 2].OpCode != OpCodes.Ldloc_S) continue;
+            if (il[k + 3].OpCode != OpCodes.Ldarg_0) continue;
+            if (il[k + 4].OpCode != OpCodes.Ldftn || !IsMethod(il[k + 4], "Save_Click")) continue;
+            if (il[k + 5].OpCode != OpCodes.Newobj) continue;
+            if (il[k + 6].OpCode != OpCodes.Ldnull) continue;
+            if (il[k + 7].OpCode != OpCodes.Ldloc_1) continue;
+            if (!IsCall(il[k + 8], "ToListItem")) continue;
+            if (!IsCall(il[k + 9], "Add")) continue;
+            if (il[k + 10].OpCode != OpCodes.Pop) continue;
+            at = k;
+            break;
+        }
+        if (at < 0) throw new Exception("version row block not found");
+
+        var getChildren = (IMethod)il[at + 1].Operand;
+        var vVersion = (Local)il[at + 2].Operand;
+        var saveClick = (IMethod)il[at + 4].Operand;
+        var itemCtor = (IMethod)il[at + 5].Operand;
+        var toListItem = (IMethod)il[at + 8].Operand;
+        var addItem = (IMethod)il[at + 9].Operand;
+        var normalTarget = il[at];
+        var loopNext = il[at + 11];
+
+        var iconType = m.Find("PCL.MyIconButton/ClickEventHandler", false) as TypeDef;
+        if (iconType == null) throw new Exception("icon handler type not found");
+        var iconCtor = iconType.FindMethod(".ctor");
+        if (iconCtor == null) throw new Exception("icon handler ctor not found");
+
+        var seq = new List<Instruction>();
+        seq.Add(Instruction.Create(OpCodes.Ldarg_0));
+        seq.Add(Instruction.Create(OpCodes.Ldfld, typeField));
+        seq.Add(Instruction.Create(OpCodes.Ldc_I4_2));
+        seq.Add(Instruction.Create(OpCodes.Bne_Un, normalTarget));
+        seq.Add(Instruction.Create(OpCodes.Ldarg_1));
+        seq.Add(Instruction.Create(OpCodes.Callvirt, getChildren));
+        seq.Add(Instruction.Create(OpCodes.Ldloc_S, vVersion));
+        seq.Add(Instruction.Create(OpCodes.Ldarg_0));
+        seq.Add(Instruction.Create(OpCodes.Ldftn, proxy));
+        seq.Add(Instruction.Create(OpCodes.Newobj, itemCtor));
+        seq.Add(Instruction.Create(OpCodes.Ldarg_0));
+        seq.Add(Instruction.Create(OpCodes.Ldftn, saveClick));
+        seq.Add(Instruction.Create(OpCodes.Newobj, iconCtor));
+        seq.Add(Instruction.Create(OpCodes.Ldloc_1));
+        seq.Add(Instruction.Create(OpCodes.Callvirt, toListItem));
+        seq.Add(Instruction.Create(OpCodes.Callvirt, addItem));
+        seq.Add(Instruction.Create(OpCodes.Pop));
+        seq.Add(Instruction.Create(OpCodes.Br, loopNext));
+
+        for (int k = 0; k < seq.Count; k++) il.Insert(at + k, seq[k]);
+
+        WidenBranches(body);
+        body.MaxStack = (ushort)Math.Max((int)body.MaxStack, 6);
+        body.UpdateInstructionOffsets();
+        Console.WriteLine("detail : instrs=" + body.Instructions.Count);
+    }
+
+    static bool IsCall(Instruction ins, string name)
+    {
+        if (ins.OpCode != OpCodes.Callvirt && ins.OpCode != OpCodes.Call) return false;
+        return IsMethod(ins, name);
+    }
+
+    static bool IsMethod(Instruction ins, string name)
+    {
+        var mr = ins.Operand as IMethod;
+        return mr != null && mr.Name == name;
+    }
+
+    // Short branches cannot reach past the inserted block, so use long forms.
+    static void WidenBranches(CilBody body)
+    {
+        foreach (var ins in body.Instructions)
+        {
+            switch (ins.OpCode.Code)
+            {
+                case Code.Br_S: ins.OpCode = OpCodes.Br; break;
+                case Code.Brfalse_S: ins.OpCode = OpCodes.Brfalse; break;
+                case Code.Brtrue_S: ins.OpCode = OpCodes.Brtrue; break;
+                case Code.Beq_S: ins.OpCode = OpCodes.Beq; break;
+                case Code.Bne_Un_S: ins.OpCode = OpCodes.Bne_Un; break;
+                case Code.Bge_S: ins.OpCode = OpCodes.Bge; break;
+                case Code.Bge_Un_S: ins.OpCode = OpCodes.Bge_Un; break;
+                case Code.Bgt_S: ins.OpCode = OpCodes.Bgt; break;
+                case Code.Bgt_Un_S: ins.OpCode = OpCodes.Bgt_Un; break;
+                case Code.Ble_S: ins.OpCode = OpCodes.Ble; break;
+                case Code.Ble_Un_S: ins.OpCode = OpCodes.Ble_Un; break;
+                case Code.Blt_S: ins.OpCode = OpCodes.Blt; break;
+                case Code.Blt_Un_S: ins.OpCode = OpCodes.Blt_Un; break;
+                case Code.Leave_S: ins.OpCode = OpCodes.Leave; break;
+            }
+        }
     }
 
     static MemberRef FindMemberRef(string type, string name)
