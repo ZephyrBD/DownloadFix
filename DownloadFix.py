@@ -557,18 +557,26 @@ NETFRAMEWORK_DL = "https://dotnet.microsoft.com/download/dotnet-framework"
 
 
 def _download(url: str, what: str, hint: str) -> bytes:
+    import socket
+    import time
     import urllib.error
     import urllib.request
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "DownloadFix.py"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as e:
-        raise PatchError("failed to fetch %s: HTTP %d\n  url: %s\n  %s"
-                         % (what, e.code, url, hint))
-    except urllib.error.URLError as e:
-        raise PatchError("failed to fetch %s: %s\n  url: %s\n  %s"
-                         % (what, e.reason, url, hint))
+    last = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "DownloadFix.py"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            raise PatchError("failed to fetch %s: HTTP %d\n  url: %s\n  %s"
+                             % (what, e.code, url, hint))
+        except (urllib.error.URLError, OSError, socket.timeout) as e:
+            last = e
+            if attempt < 2:
+                time.sleep(2 + attempt * 2)
+    reason = getattr(last, "reason", None) or last
+    raise PatchError("failed to fetch %s: %s\n  url: %s\n  %s"
+                     % (what, reason, url, hint))
 
 
 def _prepare_tool(cs_url: str) -> Path:
