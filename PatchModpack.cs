@@ -13,7 +13,14 @@ using dnlib.DotNet.Emit;
 
 class PatchModpack
 {
-    const string ComplianceMsg = "为遵守相关法律法规，PCL 暂时不再提供 MC 下载功能，非常抱歉 qwq……";
+    // 2.99.0.0 and 2.99.0.1 phrase the notice slightly differently.
+    static readonly string[] ComplianceMessages =
+    {
+        "为遵守相关法律法规，PCL 暂时不再提供 MC 下载功能，非常抱歉 qwq……",
+        "为遵守相关法律法规，PCL 不再提供 MC 下载功能，非常抱歉 qwq……",
+    };
+
+    const string HiddenSetting = "UiHiddenPageDownload";
 
     static TypeDef t;
     static ModuleDef m;
@@ -37,9 +44,41 @@ class PatchModpack
         PatchDispatch();
         PatchEntry(noFilter, keepStack);
         PatchDetailClick();
+        PatchDownloadPage();
+        PatchResourcePageType();
+        PatchInstanceModDownload();
+        PatchEmptyDownloadButton();
+        PatchLaunchButton();
+        PatchFolderInstallItem();
 
         m.Write(outPath);
         Console.WriteLine("written: " + outPath);
+    }
+
+    static TypeDef FindType(string fullName)
+    {
+        var td = m.Find(fullName, false) as TypeDef;
+        if (td == null) throw new Exception("type not found: " + fullName);
+        return td;
+    }
+
+    static MethodDef FindMethod(TypeDef td, string name, int pc)
+    {
+        var md = td.Methods.FirstOrDefault(x =>
+            x.Name == name && x.MethodSig.Params.Count == pc);
+        if (md == null || md.Body == null)
+            throw new Exception("method not found: " + td.Name + "::" + name + "/" + pc);
+        return md;
+    }
+
+    static void InsertRange(IList<Instruction> il, int at, List<Instruction> seq)
+    {
+        for (int k = 0; k < seq.Count; k++) il.Insert(at + k, seq[k]);
+    }
+
+    static bool HasString(MethodDef md, string value)
+    {
+        return md.Body.Instructions.Any(x => x.OpCode == OpCodes.Ldstr && (string)x.Operand == value);
     }
 
     static void PatchDispatch()
@@ -51,7 +90,7 @@ class PatchModpack
         int idx = -1;
         for (int i = 0; i + 2 < il.Count; i++)
         {
-            if (il[i].OpCode == OpCodes.Ldstr && (string)il[i].Operand == ComplianceMsg &&
+            if (il[i].OpCode == OpCodes.Ldstr && ComplianceMessages.Contains((string)il[i].Operand) &&
                 il[i + 1].OpCode == OpCodes.Newobj && il[i + 2].OpCode == OpCodes.Throw)
             { idx = i; break; }
         }
@@ -355,12 +394,325 @@ class PatchModpack
         Console.WriteLine("detail : instrs=" + body.Instructions.Count);
     }
 
+    // 2.99.0.1 selects the mods category on the download page, collapses the
+    // modpack entry and hides the resource section. Restore the 2.99.0.0
+    // constructor tail so the page starts on its default category again.
+    static void PatchDownloadPage()
+    {
+        var page = FindType("PCL.PageDownloadLeft");
+        var ctor = FindMethod(page, ".ctor", 0);
+        var body = ctor.Body;
+        var il = body.Instructions;
+
+        int start = -1;
+        for (int i = 0; i + 1 < il.Count; i++)
+            if (IsCall(il[i], "InitializeComponent")) { start = i + 1; break; }
+        if (start < 0) throw new Exception("download page ctor: InitializeComponent not found");
+
+        int ret = -1;
+        for (int i = start; i < il.Count; i++)
+            if (il[i].OpCode == OpCodes.Ret) { ret = i; break; }
+        if (ret < 0) throw new Exception("download page ctor: ret not found");
+
+        if (ret == start)
+        {
+            Console.WriteLine("download: page ctor already applied");
+            return;
+        }
+
+        for (int i = ret - 1; i >= start; i--) il.RemoveAt(i);
+        body.UpdateInstructionOffsets();
+        Console.WriteLine("download: page ctor instrs=" + il.Count);
+    }
+
+    // 2.99.0.1 always collapses the modpack search button. Restore the
+    // condition: it is collapsed only while the page type is modpack.
+    static void PatchResourcePageType()
+    {
+        var page = FindType("PCL.PageResource");
+        var md = FindMethod(page, "set_PageType", 1);
+        var body = md.Body;
+        var il = body.Instructions;
+
+        for (int i = 0; i + 4 < il.Count; i++)
+        {
+            if (il[i].OpCode != OpCodes.Ldarg_1 || il[i + 1].OpCode != OpCodes.Ldc_I4_2) continue;
+
+            if ((il[i + 2].OpCode == OpCodes.Beq || il[i + 2].OpCode == OpCodes.Beq_S) &&
+                (il[i + 4].OpCode == OpCodes.Br || il[i + 4].OpCode == OpCodes.Br_S) &&
+                (il[i + 3].OpCode == OpCodes.Ldc_I4_0 || il[i + 3].OpCode == OpCodes.Ldc_I4_2))
+            {
+                Console.WriteLine("resource: page type already applied");
+                return;
+            }
+            if (il[i + 2].OpCode != OpCodes.Pop || il[i + 3].OpCode != OpCodes.Pop ||
+                il[i + 4].OpCode != OpCodes.Ldc_I4_2) continue;
+            if (i + 5 >= il.Count || !IsCall(il[i + 5], "set_Visibility")) continue;
+
+            var zeroValue = il[i + 4];
+            var call = il[i + 5];
+            il[i + 2].OpCode = OpCodes.Beq;
+            il[i + 2].Operand = zeroValue;
+            il[i + 3].OpCode = OpCodes.Ldc_I4_2;
+            il[i + 3].Operand = null;
+            zeroValue.OpCode = OpCodes.Ldc_I4_0;
+            zeroValue.Operand = null;
+            il.Insert(i + 4, Instruction.Create(OpCodes.Br, call));
+            WidenBranches(body);
+            body.MaxStack = (ushort)Math.Max((int)body.MaxStack, 4);
+            body.UpdateInstructionOffsets();
+            Console.WriteLine("resource: page type instrs=" + il.Count);
+            return;
+        }
+        throw new Exception("resource page type: layout not found");
+    }
+
+    // 2.99.0.1 always collapses the download button on the disabled-mods page.
+    // Restore the 2.99.0.0 visibility computation.
+    static void PatchInstanceModDownload()
+    {
+        var page = FindType("PCL.PageInstanceModDisabled");
+        var md = FindMethod(page, "BtnDownload_Loaded", 0);
+        var il = md.Body.Instructions;
+        if (HasString(md, HiddenSetting))
+        {
+            Console.WriteLine("download: mod button already applied");
+            return;
+        }
+        if (il.Count < 2 || il[0].OpCode != OpCodes.Ldc_I4_2 || il[1].OpCode != OpCodes.Stloc_0)
+            throw new Exception("download: mod button layout not found");
+
+        var get = FindHiddenSettingGet();
+        var force = FindHiddenForceShow();
+        var frm = FindType("PCL.ModMain").FindField("FrmSelectRight");
+        var showHidden = FindType("PCL.PageSelectRight").FindField("ShowHidden");
+        if (frm == null || showHidden == null)
+            throw new Exception("download: hidden state members not found");
+
+        var zero = Instruction.Create(OpCodes.Ldc_I4_0);
+        var two = Instruction.Create(OpCodes.Ldc_I4_2);
+        var probe = Instruction.Create(OpCodes.Ldsfld, frm);
+        var test = Instruction.Create(OpCodes.Brtrue, two);
+        var store = Instruction.Create(OpCodes.Stloc_0);
+        var seq = new List<Instruction>
+        {
+            Instruction.Create(OpCodes.Ldstr, HiddenSetting),
+            Instruction.Create(OpCodes.Ldnull),
+            Instruction.Create(OpCodes.Call, get),
+            Instruction.Create(OpCodes.Brfalse, probe),
+            Instruction.Create(OpCodes.Call, force),
+            Instruction.Create(OpCodes.Brfalse, two),
+            probe,
+            Instruction.Create(OpCodes.Brfalse, zero),
+            Instruction.Create(OpCodes.Ldsfld, frm),
+            Instruction.Create(OpCodes.Ldfld, showHidden),
+            Instruction.Create(OpCodes.Br, test),
+            zero,
+            test,
+            Instruction.Create(OpCodes.Ldc_I4_0),
+            Instruction.Create(OpCodes.Br, store),
+            two,
+            store,
+        };
+        InsertRange(il, 0, seq);
+        il.RemoveAt(seq.Count);
+        il.RemoveAt(seq.Count);
+        md.Body.MaxStack = (ushort)Math.Max((int)md.Body.MaxStack, 4);
+        md.Body.UpdateInstructionOffsets();
+        Console.WriteLine("download: mod button instrs=" + il.Count);
+    }
+
+    // 2.99.0.1 always collapses the download button on the empty version list.
+    // Restore the 2.99.0.0 conditional visibility.
+    static void PatchEmptyDownloadButton()
+    {
+        var page = FindType("PCL.PageSelectRight");
+        var md = FindMethod(page, "McInstanceListUI", 1);
+        var il = md.Body.Instructions;
+        if (HasString(md, HiddenSetting))
+        {
+            Console.WriteLine("download: empty button already applied");
+            return;
+        }
+
+        int at = -1;
+        for (int i = 0; i + 2 < il.Count; i++)
+            if (IsCall(il[i], "get_BtnEmptyDownload")) at = i;
+        if (at < 0) throw new Exception("download: empty button call not found");
+        if (il[at + 1].OpCode != OpCodes.Ldc_I4_2 || !IsCall(il[at + 2], "set_Visibility"))
+            throw new Exception("download: empty button layout not found");
+
+        var get = FindHiddenSettingGet();
+        var force = FindHiddenForceShow();
+        var call = il[at + 2];
+        var zero = Instruction.Create(OpCodes.Ldc_I4_0);
+        var two = Instruction.Create(OpCodes.Ldc_I4_2);
+        var seq = new List<Instruction>
+        {
+            Instruction.Create(OpCodes.Ldstr, HiddenSetting),
+            Instruction.Create(OpCodes.Ldnull),
+            Instruction.Create(OpCodes.Call, get),
+            Instruction.Create(OpCodes.Brfalse, zero),
+            Instruction.Create(OpCodes.Call, force),
+            Instruction.Create(OpCodes.Brfalse, two),
+            zero,
+            Instruction.Create(OpCodes.Br, call),
+            two,
+        };
+        InsertRange(il, at + 1, seq);
+        il.RemoveAt(at + 1 + seq.Count);
+        WidenBranches(md.Body);
+        md.Body.MaxStack = (ushort)Math.Max((int)md.Body.MaxStack, 4);
+        md.Body.UpdateInstructionOffsets();
+        Console.WriteLine("download: empty button instrs=" + il.Count);
+    }
+
+    // 2.99.0.1 pins the "no instance selected" launch button state to 1.
+    // Restore the 2.99.0.0 conditional that may also use state 2.
+    static void PatchLaunchButton()
+    {
+        var page = FindType("PCL.PageLaunchLeft");
+        var md = FindMethod(page, "RefreshButtonsUI", 0);
+        var il = md.Body.Instructions;
+        if (HasString(md, HiddenSetting))
+        {
+            Console.WriteLine("download: launch button already applied");
+            return;
+        }
+
+        int at = -1;
+        for (int i = 0; i + 5 < il.Count; i++)
+        {
+            if (!IsCall(il[i], "get_McInstanceSelected")) continue;
+            if (il[i + 1].OpCode != OpCodes.Brtrue && il[i + 1].OpCode != OpCodes.Brtrue_S) continue;
+            if (il[i + 2].OpCode != OpCodes.Ldc_I4_1) continue;
+            if (il[i + 3].OpCode != OpCodes.Stloc_0) continue;
+            if (il[i + 4].OpCode != OpCodes.Br && il[i + 4].OpCode != OpCodes.Br_S) continue;
+            if (il[i + 5].OpCode != OpCodes.Ldc_I4_3) continue;
+            at = i + 2;
+            break;
+        }
+        if (at < 0) throw new Exception("download: launch state layout not found");
+
+        var end = il[at + 5];
+        var get = FindHiddenSettingGet();
+        var force = FindHiddenForceShow();
+        var two = Instruction.Create(OpCodes.Ldc_I4_2);
+        var seq = new List<Instruction>
+        {
+            Instruction.Create(OpCodes.Ldstr, HiddenSetting),
+            Instruction.Create(OpCodes.Ldnull),
+            Instruction.Create(OpCodes.Call, get),
+            Instruction.Create(OpCodes.Brfalse, two),
+            Instruction.Create(OpCodes.Call, force),
+            Instruction.Create(OpCodes.Brtrue, two),
+            Instruction.Create(OpCodes.Ldc_I4_1),
+            Instruction.Create(OpCodes.Stloc_0),
+            Instruction.Create(OpCodes.Br, end),
+            two,
+            Instruction.Create(OpCodes.Stloc_0),
+            Instruction.Create(OpCodes.Br, end),
+        };
+        InsertRange(il, at, seq);
+        for (int k = 0; k < 3; k++) il.RemoveAt(at + seq.Count);
+        WidenBranches(md.Body);
+        md.Body.MaxStack = (ushort)Math.Max((int)md.Body.MaxStack, 4);
+        md.Body.UpdateInstructionOffsets();
+        Console.WriteLine("download: launch button instrs=" + il.Count);
+    }
+
+    // 2.99.0.1 still builds the "install modpack" item for the selected folder
+    // but never appends it to the list. Restore the 2.99.0.0 insertion.
+    static void PatchFolderInstallItem()
+    {
+        var page = FindType("PCL.PageSelectLeft");
+        var md = FindMethod(page, "McFolderListUI", 0);
+        var il = md.Body.Instructions;
+
+        int wiring = -1;
+        for (int i = 0; i + 1 < il.Count; i++)
+        {
+            if (il[i].OpCode != OpCodes.Ldloc_1 || il[i + 1].OpCode != OpCodes.Ldsfld) continue;
+            var field = il[i + 1].Operand as IField;
+            if (field == null || field.Name != "$IR4-8") continue;
+            wiring = i;
+            break;
+        }
+        if (wiring < 0) throw new Exception("download: folder install item not found");
+        if (wiring > 0 && il[wiring - 1].OpCode == OpCodes.Pop)
+        {
+            Console.WriteLine("download: folder install item already applied");
+            return;
+        }
+
+        IField frmLeft = null;
+        IMethod panList = null, children = null, add = null;
+        foreach (var ins in il)
+        {
+            var field = ins.Operand as IField;
+            if (ins.OpCode == OpCodes.Ldsfld && frmLeft == null && field != null &&
+                field.Name == "FrmSelectLeft")
+                frmLeft = field;
+            var mm = ins.Operand as IMethod;
+            if (ins.OpCode != OpCodes.Callvirt || mm == null) continue;
+            if (panList == null && mm.Name == "get_PanList") panList = mm;
+            if (children == null && mm.Name == "get_Children") children = mm;
+            if (add == null && mm.Name == "Add" && mm.MethodSig.Params.Count == 1 &&
+                mm.DeclaringType.FullName.Contains("UIElementCollection"))
+                add = mm;
+        }
+        if (frmLeft == null || panList == null || children == null || add == null)
+            throw new Exception("download: folder list members not found");
+
+        var seq = new List<Instruction>
+        {
+            Instruction.Create(OpCodes.Ldsfld, frmLeft),
+            Instruction.Create(OpCodes.Callvirt, panList),
+            Instruction.Create(OpCodes.Callvirt, children),
+            Instruction.Create(OpCodes.Ldloc_1),
+            Instruction.Create(OpCodes.Callvirt, add),
+            Instruction.Create(OpCodes.Pop),
+        };
+        InsertRange(il, wiring, seq);
+        WidenBranches(md.Body);
+        md.Body.MaxStack = (ushort)Math.Max((int)md.Body.MaxStack, 4);
+        md.Body.UpdateInstructionOffsets();
+        Console.WriteLine("download: folder install item instrs=" + il.Count);
+    }
+
+    static MethodDef FindHiddenStateMethod()
+    {
+        return FindMethod(FindType("PCL.PageSelectRight"), "BtnEmptyDownload_Loaded", 0);
+    }
+
+    static IMethod FindHiddenSettingGet()
+    {
+        foreach (var ins in FindHiddenStateMethod().Body.Instructions)
+        {
+            var mm = ins.Operand as IMethod;
+            if (ins.OpCode == OpCodes.Call && mm != null && mm.Name == "Get" &&
+                mm.DeclaringType.FullName == "PCL.Settings")
+                return mm;
+        }
+        throw new Exception("hidden setting accessor not found");
+    }
+
+    static IMethod FindHiddenForceShow()
+    {
+        foreach (var ins in FindHiddenStateMethod().Body.Instructions)
+        {
+            var mm = ins.Operand as IMethod;
+            if (ins.OpCode == OpCodes.Call && mm != null && mm.Name == "get_HiddenForceShow")
+                return mm;
+        }
+        throw new Exception("hidden force-show accessor not found");
+    }
+
     static bool IsCall(Instruction ins, string name)
     {
         if (ins.OpCode != OpCodes.Callvirt && ins.OpCode != OpCodes.Call) return false;
         return IsMethod(ins, name);
     }
-
     static bool IsMethod(Instruction ins, string name)
     {
         var mr = ins.Operand as IMethod;

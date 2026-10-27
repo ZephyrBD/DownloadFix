@@ -33,7 +33,7 @@ python DownloadFix.py "E:\PCL\Plain Craft Launcher 2.exe"
 
 ## Notes
 
-- Tested only against version 2.99; it may stop working after PCL updates.
+- Tested against PCL 2.99.0.0 and 2.99.0.1; it may stop working after later PCL updates.
 
 ## License & Attribution
 
