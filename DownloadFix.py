@@ -37,6 +37,26 @@ DEFAULT_EXE = HERE / "Plain Craft Launcher 2.exe"
 CS_URL = "https://raw.githubusercontent.com/ZephyrBD/DownloadFix/main/PatchModpack.cs"
 WORK_DIR = Path(tempfile.gettempdir()) / "pcl_patch_build"
 
+# Keep in sync with the Patch* calls in PatchModpack.cs (fetched at run time).
+PATCH_PLAN = (
+    ("download gate", "PageDownloadInstall.LoaderInit"),
+    ("modpack dispatch", "ModModpack.ModpackInstall (3 params)"),
+    ("modpack entry", "ModModpack.ModpackInstall"),
+    ("detail click", "PageDownloadResourceDetail"),
+    ("download page", "PageDownloadLeft..ctor"),
+    ("resource page", "PageResource.set_PageType"),
+    ("disabled mod download", "PageInstanceModDisabled.BtnDownload_Loaded"),
+    ("empty download", "PageSelectRight.McInstanceListUI"),
+    ("launch button", "PageLaunchLeft.RefreshButtonsUI"),
+    ("folder install", "PageSelectLeft.McFolderListUI"),
+    ("update source", "ModSecret update URL selection"),
+)
+
+GATE_PLAN = {"original": "pending", "patched": "already applied",
+             "not_needed": "not required"}
+GATE_STEP = {"original": "applied", "patched": "already applied",
+             "not_needed": "not required"}
+
 class PatchError(RuntimeError):
     pass
 
@@ -687,18 +707,36 @@ def main(argv: list[str]) -> int:
             print("[x] %s" % ex)
         return 0
 
+    try:
+        info = describe(data)
+    except PatchError as ex:
+        print("[x] %s" % ex)
+        return 1
+
+    version = str(info.get("assembly") or "").rsplit(" ", 1)[-1] or "unknown"
+    loader = info.get("loaderinit")
+    state = loader.get("state") if isinstance(loader, dict) else None
+
+    print("target  : %s" % src)
+    print("version : PCL %s" % version)
+    print("patches : %d (items already present are skipped)" % len(PATCH_PLAN))
+    for name, where in PATCH_PLAN:
+        note = ""
+        if name == "download gate":
+            note = " [%s]" % GATE_PLAN.get(state, "unknown")
+        print("  - %-22s %s%s" % (name, where, note))
+    print()
+
     stage = WORK_DIR / "modpack_stage.tmp.exe"
 
     try:
         run_modpack(src, stage, args.cs_url)
 
-        print("[2/2] Download Fix")
+        print("[2/2] download gate")
         mid_data = stage.read_bytes()
         target = Target(Metadata(mid_data, PEImage(mid_data)))
-        label = {"original": "pending",
-                 "patched": "already done",
-                 "not_needed": "not required"}[target.state]
-        print("  state : %s" % label)
+        label = GATE_STEP[target.state]
+        print("  %-24s %s" % ("download gate", label))
         if target.state == "original":
             target.verify()
             patched = target.build()

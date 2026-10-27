@@ -50,6 +50,7 @@ class PatchModpack
         PatchEmptyDownloadButton();
         PatchLaunchButton();
         PatchFolderInstallItem();
+        PatchFullUpdate();
 
         m.Write(outPath);
         Console.WriteLine("written: " + outPath);
@@ -74,6 +75,11 @@ class PatchModpack
     static void InsertRange(IList<Instruction> il, int at, List<Instruction> seq)
     {
         for (int k = 0; k < seq.Count; k++) il.Insert(at + k, seq[k]);
+    }
+
+    static void Step(string name, string detail)
+    {
+        Console.WriteLine("  {0,-24} {1}", name, detail);
     }
 
     static bool HasString(MethodDef md, string value)
@@ -174,7 +180,7 @@ class PatchModpack
 
         body.MaxStack = (ushort)Math.Max((int)body.MaxStack, 6);
         body.UpdateInstructionOffsets();
-        Console.WriteLine("dispatch: instrs=" + il.Count);
+        Step("modpack dispatch", "applied, " + il.Count + " instrs");
     }
 
     static void PatchEntry(bool noFilter, bool keepStack)
@@ -277,7 +283,7 @@ class PatchModpack
         body.MaxStack = 8;
         body.KeepOldMaxStack = keepStack;
         body.UpdateInstructionOffsets();
-        Console.WriteLine("entry   : instrs=" + il.Count);
+        Step("modpack entry", "applied, " + il.Count + " instrs");
     }
 
     // Restore the version-item click behaviour on the resource detail page.
@@ -304,7 +310,7 @@ class PatchModpack
             if (ins.OpCode == OpCodes.Ldfld && ins.Operand == typeField) reads++;
         if (reads > 1)
         {
-            Console.WriteLine("detail : already applied");
+            Step("detail click", "already applied");
             return;
         }
 
@@ -391,7 +397,7 @@ class PatchModpack
         WidenBranches(body);
         body.MaxStack = (ushort)Math.Max((int)body.MaxStack, 6);
         body.UpdateInstructionOffsets();
-        Console.WriteLine("detail : instrs=" + body.Instructions.Count);
+        Step("detail click", "applied, " + body.Instructions.Count + " instrs");
     }
 
     // 2.99.0.1 selects the mods category on the download page, collapses the
@@ -416,13 +422,13 @@ class PatchModpack
 
         if (ret == start)
         {
-            Console.WriteLine("download: page ctor already applied");
+            Step("download page", "already applied");
             return;
         }
 
         for (int i = ret - 1; i >= start; i--) il.RemoveAt(i);
         body.UpdateInstructionOffsets();
-        Console.WriteLine("download: page ctor instrs=" + il.Count);
+        Step("download page", "applied, " + il.Count + " instrs");
     }
 
     // 2.99.0.1 always collapses the modpack search button. Restore the
@@ -442,7 +448,7 @@ class PatchModpack
                 (il[i + 4].OpCode == OpCodes.Br || il[i + 4].OpCode == OpCodes.Br_S) &&
                 (il[i + 3].OpCode == OpCodes.Ldc_I4_0 || il[i + 3].OpCode == OpCodes.Ldc_I4_2))
             {
-                Console.WriteLine("resource: page type already applied");
+                Step("resource page", "already applied");
                 return;
             }
             if (il[i + 2].OpCode != OpCodes.Pop || il[i + 3].OpCode != OpCodes.Pop ||
@@ -461,7 +467,7 @@ class PatchModpack
             WidenBranches(body);
             body.MaxStack = (ushort)Math.Max((int)body.MaxStack, 4);
             body.UpdateInstructionOffsets();
-            Console.WriteLine("resource: page type instrs=" + il.Count);
+            Step("resource page", "applied, " + il.Count + " instrs");
             return;
         }
         throw new Exception("resource page type: layout not found");
@@ -476,7 +482,7 @@ class PatchModpack
         var il = md.Body.Instructions;
         if (HasString(md, HiddenSetting))
         {
-            Console.WriteLine("download: mod button already applied");
+            Step("disabled mod download", "already applied");
             return;
         }
         if (il.Count < 2 || il[0].OpCode != OpCodes.Ldc_I4_2 || il[1].OpCode != OpCodes.Stloc_0)
@@ -519,7 +525,7 @@ class PatchModpack
         il.RemoveAt(seq.Count);
         md.Body.MaxStack = (ushort)Math.Max((int)md.Body.MaxStack, 4);
         md.Body.UpdateInstructionOffsets();
-        Console.WriteLine("download: mod button instrs=" + il.Count);
+        Step("disabled mod download", "applied, " + il.Count + " instrs");
     }
 
     // 2.99.0.1 always collapses the download button on the empty version list.
@@ -531,7 +537,7 @@ class PatchModpack
         var il = md.Body.Instructions;
         if (HasString(md, HiddenSetting))
         {
-            Console.WriteLine("download: empty button already applied");
+            Step("empty download", "already applied");
             return;
         }
 
@@ -564,7 +570,7 @@ class PatchModpack
         WidenBranches(md.Body);
         md.Body.MaxStack = (ushort)Math.Max((int)md.Body.MaxStack, 4);
         md.Body.UpdateInstructionOffsets();
-        Console.WriteLine("download: empty button instrs=" + il.Count);
+        Step("empty download", "applied, " + il.Count + " instrs");
     }
 
     // 2.99.0.1 pins the "no instance selected" launch button state to 1.
@@ -576,7 +582,7 @@ class PatchModpack
         var il = md.Body.Instructions;
         if (HasString(md, HiddenSetting))
         {
-            Console.WriteLine("download: launch button already applied");
+            Step("launch button", "already applied");
             return;
         }
 
@@ -618,7 +624,7 @@ class PatchModpack
         WidenBranches(md.Body);
         md.Body.MaxStack = (ushort)Math.Max((int)md.Body.MaxStack, 4);
         md.Body.UpdateInstructionOffsets();
-        Console.WriteLine("download: launch button instrs=" + il.Count);
+        Step("launch button", "applied, " + il.Count + " instrs");
     }
 
     // 2.99.0.1 still builds the "install modpack" item for the selected folder
@@ -641,7 +647,7 @@ class PatchModpack
         if (wiring < 0) throw new Exception("download: folder install item not found");
         if (wiring > 0 && il[wiring - 1].OpCode == OpCodes.Pop)
         {
-            Console.WriteLine("download: folder install item already applied");
+            Step("folder install", "already applied");
             return;
         }
 
@@ -677,7 +683,78 @@ class PatchModpack
         WidenBranches(md.Body);
         md.Body.MaxStack = (ushort)Math.Max((int)md.Body.MaxStack, 4);
         md.Body.UpdateInstructionOffsets();
-        Console.WriteLine("download: folder install item instrs=" + il.Count);
+        Step("folder install", "applied, " + il.Count + " instrs");
+    }
+
+    // 2.99.x builds delta-patch URLs from the MD5/SHA1 of the running exe.
+    // A patched exe no longer matches any published patch, so the request ends
+    // up as HTTP 404. Skip the PatchUrls branch and use the full package list.
+    static void PatchFullUpdate()
+    {
+        MethodDef found = null;
+        int at = -1;
+        bool applied = false;
+        Instruction target = null;
+
+        foreach (var type in m.GetTypes())
+        {
+            foreach (var cand in type.Methods)
+            {
+                if (cand.Body == null) continue;
+                if (!HasString(cand, "PatchUrls") || !HasString(cand, "DownloadUrls")) continue;
+                var il = cand.Body.Instructions;
+                for (int i = 0; i + 3 < il.Count; i++)
+                {
+                    if (il[i].OpCode != OpCodes.Ldstr || (string)il[i].Operand != "PatchUrls") continue;
+                    if (!IsCall(il[i + 1], "ContainsKey")) continue;
+
+                    if (il[i + 2].OpCode == OpCodes.Brfalse || il[i + 2].OpCode == OpCodes.Brfalse_S)
+                    {
+                        target = il[i + 2].Operand as Instruction;
+                        applied = false;
+                    }
+                    else if (il[i + 2].OpCode == OpCodes.Pop && il[i + 3].OpCode == OpCodes.Br)
+                    {
+                        target = il[i + 3].Operand as Instruction;
+                        applied = true;
+                    }
+                    else continue;
+
+                    if (found != null) throw new Exception("update source: ambiguous layout");
+                    found = cand;
+                    at = i + 2;
+                }
+            }
+        }
+        if (found == null) throw new Exception("update source: layout not found");
+
+        var body = found.Body;
+        var il2 = body.Instructions;
+        int t = -1;
+        for (int i = 0; i < il2.Count; i++)
+            if (ReferenceEquals(il2[i], target)) { t = i; break; }
+        if (t < 0) throw new Exception("update source: branch target not found");
+
+        bool fullPackage = false;
+        for (int i = t; i < il2.Count && i <= t + 4; i++)
+            if (il2[i].OpCode == OpCodes.Ldstr && (string)il2[i].Operand == "DownloadUrls")
+                fullPackage = true;
+        if (!fullPackage) throw new Exception("update source: unexpected branch target");
+
+        if (applied)
+        {
+            Step("update source", "already applied");
+            return;
+        }
+
+        // Keep the stack balanced: the conditional branch consumes the
+        // ContainsKey result, so replace it with pop + unconditional jump over
+        // the PatchUrls block.
+        il2[at].OpCode = OpCodes.Pop;
+        il2[at].Operand = null;
+        il2.Insert(at + 1, Instruction.Create(OpCodes.Br, target));
+        body.UpdateInstructionOffsets();
+        Step("update source", "full package");
     }
 
     static MethodDef FindHiddenStateMethod()
